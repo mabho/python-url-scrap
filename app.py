@@ -1,9 +1,9 @@
 # app.py
 from flask import Flask, request, render_template_string
 import requests
-from bs4 import BeautifulSoup
-import html
+from bs4 import BeautifulSoup, Tag
 from urllib.parse import urlparse
+import re
 
 app = Flask(__name__)
 
@@ -12,12 +12,9 @@ app = Flask(__name__)
 # ========================
 
 BASE_SELECTOR = ".ResponsivePage-content"
-
-# Only block-level tags; inline tags will be kept automatically
 ALLOWED_TAGS = {"p", "blockquote", "ul", "ol", "li", "h2", "h3", "h4", "h5", "h6"}
-
-# Special sequences to handle separately
-SPECIAL_SEQUENCE = [("iframe", "script")]
+# We look for iframe followed (in document order) by a script within the same allowed element.
+SPECIAL_SEQUENCE = ("iframe", "script")
 
 # ========================
 # --- TEMPLATE ----------
@@ -65,7 +62,7 @@ TEMPLATE = """
 
   {% if html_source %}
     <h2>Full HTML source</h2>
-    <pre>{{ html_source|safe }}</pre>
+    <pre>{{ html_source }}</pre>
   {% endif %}
 </body>
 </html>
@@ -87,12 +84,92 @@ def normalize_url(u: str) -> str:
         return ""
     return u
 
-
-def extract_blocks_recursive(element):
+def _find_script_after(tag: Tag, boundary: Tag):
     """
-    Recursively traverse element's children to extract allowed tags
-    and iframe+script sequences.
-    Returns a list of HTML strings, each to be wrapped in <pre>.
+    Given a Tag `tag` (an iframe) return the first <script> Tag that occurs
+    after `tag` in document order but still within `boundary` (the allowed element).
+    Return None if not found.
+    """
+    for node in tag.next_elements:
+        if isinstance(node, Tag) and node.name == "script":
+            # ensure node is inside boundary
+            if boundary in node.parents:
+                return node
+            else:
+                return None
+    return None
+
+def _process_allowed_element(el: Tag):
+    """
+    Given an allowed block Tag el, find any iframe+script pairs inside it,
+    extract them, and split el's HTML into a sequence of parts:
+     - content segments (strings) and
+     - iframe blocks (strings)
+    Returns list of parts in order. iframe-block parts are exact HTML strings containing the iframe+script.
+    """
+    # Collect pairs in document order
+    pairs = []
+    for iframe in el.find_all("iframe"):
+        script = _find_script_after(iframe, el)
+        if script is not None:
+            pairs.append((iframe, script))
+
+    if not pairs:
+        # no special sequences: single content piece = the whole element HTML
+        return [str(el)]
+
+    # Build replacement tokens and mapping
+    token_map = {}
+    html_str = str(el)
+    for idx, (iframe, script) in enumerate(pairs):
+        pair_html = str(iframe) + str(script)
+        token = f"@@IFRAME_SEQ_{idx}@@"
+        # Replace only the first occurrence of this exact sequence
+        html_str, n = re.subn(re.escape(pair_html), token, html_str, count=1, flags=re.DOTALL)
+        if n == 1:
+            token_map[token] = pair_html
+        else:
+            # fallback: if exact concatenation didn't match (rare), try replacing iframe alone then script alone
+            # replace iframe first
+            iframe_token = f"@@IFRAME_ONLY_{idx}@@"
+            html_str, n1 = re.subn(re.escape(str(iframe)), iframe_token, html_str, count=1, flags=re.DOTALL)
+            script_token = f"@@SCRIPT_ONLY_{idx}@@"
+            html_str, n2 = re.subn(re.escape(str(script)), script_token, html_str, count=1, flags=re.DOTALL)
+            # assemble pair if both replaced
+            if n1 == 1 and n2 == 1:
+                # join tokens so splitting keeps them together
+                combined_token = f"@@IFRAME_SEQ_{idx}@@"
+                html_str = html_str.replace(iframe_token + ".*?" + script_token, combined_token)  # not ideal, but fallback
+                token_map[combined_token] = str(iframe) + str(script)
+            else:
+                # give up for this pair (leave as-is)
+                pass
+
+    # Split by tokens while keeping them
+    parts = re.split(r'(@@IFRAME_SEQ_\d+@@)', html_str)
+
+    result = []
+    for part in parts:
+        if not part:
+            continue
+        m = re.match(r'@@IFRAME_SEQ_(\d+)@@', part)
+        if m:
+            token = part
+            if token in token_map:
+                result.append(token_map[token])
+            # else skip unknown token
+        else:
+            # keep content segment if not purely whitespace
+            if part.strip():
+                result.append(part)
+    return result
+
+def extract_blocks_recursive(element: Tag):
+    """
+    Traverse element recursively and collect blocks.
+    Allowed elements produce content parts (which may be split by iframe/script).
+    iframe+script blocks extracted from allowed elements are emitted as separate blocks.
+    Consecutive content segments are grouped into current_group and flushed to blocks when a special block is emitted.
     """
     blocks = []
     current_group = []
@@ -100,34 +177,35 @@ def extract_blocks_recursive(element):
     def traverse(el):
         nonlocal current_group
 
-        if not getattr(el, "name", None):
+        if not isinstance(el, Tag):
             return
 
-        # --- Special sequences (iframe + script) ---
-        for seq in SPECIAL_SEQUENCE:
-            if el.name == seq[0] and el.next_sibling and getattr(el.next_sibling, "name", None) == seq[1]:
-                # Finish current group if it exists
-                if current_group:
-                    blocks.append("".join(current_group))
-                    current_group.clear()
-                # Add special sequence as its own block
-                blocks.append(str(el) + "\n" + str(el.next_sibling))
-                return  # Do not descend further
-
-        # --- Allowed block tags ---
+        # If this is an allowed block, process it (do NOT descend further for this el)
         if el.name in ALLOWED_TAGS:
-            current_group.append(str(el))
-            return  # Do not descend further
+            parts = _process_allowed_element(el)
+            for part in parts:
+                # part is either a content HTML (string) or an iframe+script HTML (string containing '<iframe' and '<script')
+                if "<iframe" in part and "<script" in part:
+                    # flush current_group first
+                    if current_group:
+                        blocks.append("".join(current_group))
+                        current_group = []
+                    # append the iframe block as its own block
+                    blocks.append(part)
+                else:
+                    # a content segment; append to grouping
+                    current_group.append(part)
+            return  # stop descending into this allowed block
 
-        # --- Otherwise, traverse children recursively ---
+        # Not an allowed block: descend children
         for child in el.children:
             traverse(child)
 
-    # Traverse all direct children of base element
+    # Start traversal from direct children of base element (preserve order)
     for child in element.children:
         traverse(child)
 
-    # Append any remaining content group at the end
+    # flush final group
     if current_group:
         blocks.append("".join(current_group))
 
@@ -162,13 +240,12 @@ def index():
 
                 soup = BeautifulSoup(html_source, "html.parser")
                 content = soup.select_one(BASE_SELECTOR)
-
                 if not content:
                     error = f"Could not find {BASE_SELECTOR} in the page."
                 else:
                     extracted_blocks = extract_blocks_recursive(content)
 
-                    # Compute summary
+                    # compute summary
                     for block_html in extracted_blocks:
                         if "<iframe" in block_html and "<script" in block_html:
                             summary["iframe_blocks"] += 1
@@ -178,12 +255,11 @@ def index():
             except requests.exceptions.RequestException as e:
                 error = f"Request failed: {e}"
 
-    escaped_full_html = html.escape(html_source) if html_source else None
-
+    # pass raw html_source (Jinja will escape in the template)
     return render_template_string(
         TEMPLATE,
         error=error,
-        html_source=escaped_full_html,
+        html_source=html_source,
         url_value=url_value,
         displayed_url=displayed_url,
         extracted_blocks=extracted_blocks,
