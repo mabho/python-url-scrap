@@ -11,7 +11,7 @@ app = Flask(__name__)
 # --- CONFIGURATION ------
 # ========================
 
-BASE_SELECTOR = ".ResponsivePage-content"
+BASE_SELECTOR = ".ResponsivePage-content, .BlogPost"
 ALLOWED_TAGS = {"p", "blockquote", "ul", "ol", "li", "h2", "h3", "h4", "h5", "h6"}
 # We look for iframe followed (in document order) by a script within the same allowed element.
 SPECIAL_SEQUENCE = ("iframe", "script")
@@ -31,10 +31,34 @@ TEMPLATE = """
     form { margin-bottom: 1rem; display:flex; gap:8px; align-items:center; }
     input[type="text"] { flex:1; padding:8px; font-size:1rem; }
     button { padding:8px 12px; font-size:1rem; }
-    pre { background:#f6f8fa; border:1px solid #e1e4e8; padding:12px; overflow:auto; white-space:pre-wrap; }
+    pre { background:#f6f8fa; border:1px solid #e1e4e8; padding:12px; overflow:auto; white-space:pre-wrap; position: relative; }
     .summary { margin-bottom:1rem; color:#333; }
     .error { color:#a00; }
     h3 { color:#0969da; margin-top: 1.5rem; margin-bottom: 0.5rem; font-size: 1.1rem; }
+    .code-block { position: relative; margin-bottom: 1rem; }
+    .copy-btn { 
+      position: absolute;
+      top: 8px; 
+      right: 8px; 
+      background: #f6f8fa; 
+      border: 1px solid #d1d9e0; 
+      border-radius: 4px; 
+      padding: 4px 8px; 
+      font-size: 0.8rem; 
+      cursor: pointer; 
+      color: #656d76;
+      transition: all 0.2s;
+      z-index: 10;
+    }
+    .copy-btn:hover { 
+      background: #e1e4e8; 
+      border-color: #afb8c1; 
+    }
+    .copy-btn.copied { 
+      background: #d1f7d1; 
+      border-color: #74c574; 
+      color: #0f5132; 
+    }
   </style>
 </head>
 <body>
@@ -57,14 +81,77 @@ TEMPLATE = """
   {% if extracted_blocks %}
     <h2>Extracted content blocks</h2>
     {% for block in extracted_blocks %}
-      <pre>{{ block }}</pre>
+      {% if block.is_iframe and block.title %}
+        <h3>[Datawrapper] {{ block.title }}</h3>
+      {% endif %}
+      <div class="code-block">
+        <button class="copy-btn" onclick="copyToClipboard(this)">Copy</button>
+        <pre>{{ block.html }}</pre>
+      </div>
     {% endfor %}
   {% endif %}
 
   {% if html_source %}
     <h2>Full HTML source</h2>
-    <pre>{{ html_source }}</pre>
+    <div class="code-block">
+      <button class="copy-btn" onclick="copyToClipboard(this)">Copy</button>
+      <pre>{{ html_source }}</pre>
+    </div>
   {% endif %}
+
+  <script>
+    function copyToClipboard(button) {
+      // Find the pre element that's a sibling of the button
+      const preElement = button.parentElement.querySelector('pre');
+      const textToCopy = preElement.textContent;
+      
+      // Use the modern clipboard API
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(textToCopy).then(() => {
+          showCopySuccess(button);
+        }).catch(err => {
+          // Fallback to the older method
+          fallbackCopyToClipboard(textToCopy, button);
+        });
+      } else {
+        // Fallback for older browsers or non-secure contexts
+        fallbackCopyToClipboard(textToCopy, button);
+      }
+    }
+    
+    function fallbackCopyToClipboard(text, button) {
+      const textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.style.position = 'fixed';
+      textArea.style.opacity = '0';
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      
+      try {
+        document.execCommand('copy');
+        showCopySuccess(button);
+      } catch (err) {
+        console.error('Failed to copy text: ', err);
+        button.textContent = 'Failed';
+        setTimeout(() => {
+          button.textContent = 'Copy';
+          button.classList.remove('copied');
+        }, 2000);
+      }
+      
+      document.body.removeChild(textArea);
+    }
+    
+    function showCopySuccess(button) {
+      button.textContent = 'Copied!';
+      button.classList.add('copied');
+      setTimeout(() => {
+        button.textContent = 'Copy';
+        button.classList.remove('copied');
+      }, 2000);
+    }
+  </script>
 </body>
 </html>
 """
@@ -119,6 +206,41 @@ def normalize_url(u: str) -> str:
         return ""
     return u
 
+def clean_orphaned_tags(html_fragment: str) -> str:
+    """
+    Clean up orphaned opening and closing tags from HTML fragments.
+    Removes standalone opening/closing tags that don't have their counterpart.
+    """
+    if not html_fragment or not html_fragment.strip():
+        return ""
+    
+    # Parse the fragment
+    try:
+        soup = BeautifulSoup(html_fragment, "html.parser")
+        
+        # If the fragment only contains orphaned tags (like just "<p>" or "</p>"), 
+        # it will be mostly empty after parsing
+        text_content = soup.get_text(strip=True)
+        
+        # Check if we have meaningful content vs just whitespace/orphaned tags
+        if not text_content:
+            # Check if we have any complete tags with content
+            has_complete_tags = False
+            for tag in soup.find_all():
+                if tag.get_text(strip=True):
+                    has_complete_tags = True
+                    break
+            
+            if not has_complete_tags:
+                return ""  # This fragment is just orphaned tags, discard it
+        
+        # Return the cleaned HTML
+        return str(soup)
+    
+    except Exception:
+        # If parsing fails, return the original fragment
+        return html_fragment
+
 def _find_script_after(tag: Tag, boundary: Tag):
     """
     Given a Tag `tag` (an iframe) return the first <script> Tag that occurs
@@ -139,8 +261,8 @@ def _process_allowed_element(el: Tag, base_url: str = ""):
     Given an allowed block Tag el, find any iframe+script pairs inside it,
     extract them, and split el's HTML into a sequence of parts:
      - content segments (strings) and
-     - iframe blocks (strings with title prefixes)
-    Returns list of parts in order. iframe-block parts are strings containing title + iframe+script HTML.
+     - iframe blocks (tuples of (html_string, title_string))
+    Returns list of parts in order. iframe-block parts are tuples containing (iframe+script HTML, title).
     """
     # Collect pairs in document order
     pairs = []
@@ -165,17 +287,12 @@ def _process_allowed_element(el: Tag, base_url: str = ""):
         
         pair_html = str(iframe) + str(script)
         
-        # Add title prefix if found
-        if title:
-            prefixed_html = f"<h3>{title}</h3>\n{pair_html}"
-        else:
-            prefixed_html = pair_html
-        
+        # Store the title separately, don't embed it in HTML
         token = f"@@IFRAME_SEQ_{idx}@@"
         # Replace only the first occurrence of this exact sequence
         html_str, n = re.subn(re.escape(pair_html), token, html_str, count=1, flags=re.DOTALL)
         if n == 1:
-            token_map[token] = prefixed_html
+            token_map[token] = (pair_html, title)  # Store as tuple: (html, title)
         else:
             # fallback: if exact concatenation didn't match (rare), try replacing iframe alone then script alone
             # replace iframe first
@@ -188,7 +305,7 @@ def _process_allowed_element(el: Tag, base_url: str = ""):
                 # join tokens so splitting keeps them together
                 combined_token = f"@@IFRAME_SEQ_{idx}@@"
                 html_str = html_str.replace(iframe_token + ".*?" + script_token, combined_token)  # not ideal, but fallback
-                token_map[combined_token] = prefixed_html
+                token_map[combined_token] = (pair_html, title)  # Store as tuple: (html, title)
             else:
                 # give up for this pair (leave as-is)
                 pass
@@ -204,12 +321,13 @@ def _process_allowed_element(el: Tag, base_url: str = ""):
         if m:
             token = part
             if token in token_map:
-                result.append(token_map[token])
+                result.append(token_map[token])  # This is now a tuple (html, title)
             # else skip unknown token
         else:
             # keep content segment if not purely whitespace
-            if part.strip():
-                result.append(part)
+            cleaned_part = clean_orphaned_tags(part)
+            if cleaned_part.strip():
+                result.append(cleaned_part)
     return result
 
 def extract_blocks_recursive(element: Tag, base_url: str = ""):
@@ -217,45 +335,81 @@ def extract_blocks_recursive(element: Tag, base_url: str = ""):
     Traverse element recursively and collect blocks.
     Allowed elements produce content parts (which may be split by iframe/script).
     iframe+script blocks extracted from allowed elements are emitted as separate blocks.
+    Also detects iframe+script pairs that are siblings to allowed elements.
     Consecutive content segments are grouped into current_group and flushed to blocks when a special block is emitted.
     """
     blocks = []
     current_group = []
 
-    def traverse(el):
+    def flush_current_group():
         nonlocal current_group
+        if current_group:
+            blocks.append("".join(current_group))
+            current_group = []
 
-        if not isinstance(el, Tag):
-            return
-
-        # If this is an allowed block, process it (do NOT descend further for this el)
-        if el.name in ALLOWED_TAGS:
-            parts = _process_allowed_element(el, base_url)
+    # Collect all direct children as tags
+    tag_children = [child for child in element.children if isinstance(child, Tag)]
+    
+    # Process children in order, detecting iframe+script sibling pairs
+    i = 0
+    while i < len(tag_children):
+        child = tag_children[i]
+        
+        # Check if current child is iframe and next child is script (sibling pair)
+        if (child.name == "iframe" and 
+            i + 1 < len(tag_children) and 
+            tag_children[i + 1].name == "script"):
+            
+            # Found iframe+script sibling pair
+            iframe = child
+            script = tag_children[i + 1]
+            
+            # Extract iframe src and fetch title
+            iframe_src = iframe.get('src', '')
+            title = ""
+            if iframe_src:
+                title = fetch_iframe_title(iframe_src, base_url)
+            
+            pair_html = str(iframe) + str(script)
+            
+            # Flush any accumulated content to maintain order
+            flush_current_group()
+            
+            # Add iframe block at current position
+            blocks.append((pair_html, title))
+            
+            # Skip the script tag since we processed it with iframe
+            i += 2
+            continue
+        
+        # Process single child normally
+        if child.name in ALLOWED_TAGS:
+            # This is an allowed block, process it
+            parts = _process_allowed_element(child, base_url)
             for part in parts:
-                # part is either a content HTML (string) or an iframe+script HTML (string containing '<iframe' and '<script')
-                if "<iframe" in part and "<script" in part:
-                    # flush current_group first
-                    if current_group:
-                        blocks.append("".join(current_group))
-                        current_group = []
-                    # append the iframe block as its own block
+                if isinstance(part, tuple):
+                    # This is an iframe block tuple (html, title) from within allowed tag
+                    flush_current_group()
                     blocks.append(part)
                 else:
                     # a content segment; append to grouping
                     current_group.append(part)
-            return  # stop descending into this allowed block
-
-        # Not an allowed block: descend children
-        for child in el.children:
-            traverse(child)
-
-    # Start traversal from direct children of base element (preserve order)
-    for child in element.children:
-        traverse(child)
+        else:
+            # Not an allowed tag, recursively process its children
+            child_blocks = extract_blocks_recursive(child, base_url)
+            for block in child_blocks:
+                if isinstance(block, tuple):
+                    # iframe block from deeper level
+                    flush_current_group()
+                    blocks.append(block)
+                else:
+                    # content block from deeper level
+                    current_group.append(block)
+        
+        i += 1
 
     # flush final group
-    if current_group:
-        blocks.append("".join(current_group))
+    flush_current_group()
 
     return blocks
 
@@ -293,12 +447,28 @@ def index():
                 else:
                     extracted_blocks = extract_blocks_recursive(content, normalized)
 
-                    # compute summary
-                    for block_html in extracted_blocks:
-                        if "<iframe" in block_html and "<script" in block_html:
+                    # Prepare blocks for template with metadata
+                    template_blocks = []
+                    for block in extracted_blocks:
+                        if isinstance(block, tuple):
+                            # iframe block: (html, title)
+                            html, title = block
+                            template_blocks.append({
+                                'html': html,
+                                'is_iframe': True,
+                                'title': title
+                            })
                             summary["iframe_blocks"] += 1
                         else:
+                            # content block: just html string
+                            template_blocks.append({
+                                'html': block,
+                                'is_iframe': False,
+                                'title': ''
+                            })
                             summary["content_blocks"] += 1
+                    
+                    extracted_blocks = template_blocks
 
             except requests.exceptions.RequestException as e:
                 error = f"Request failed: {e}"
