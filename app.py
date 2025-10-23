@@ -2,7 +2,7 @@
 from flask import Flask, request, render_template_string
 import requests
 from bs4 import BeautifulSoup, Tag
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import re
 
 app = Flask(__name__)
@@ -34,6 +34,7 @@ TEMPLATE = """
     pre { background:#f6f8fa; border:1px solid #e1e4e8; padding:12px; overflow:auto; white-space:pre-wrap; }
     .summary { margin-bottom:1rem; color:#333; }
     .error { color:#a00; }
+    h3 { color:#0969da; margin-top: 1.5rem; margin-bottom: 0.5rem; font-size: 1.1rem; }
   </style>
 </head>
 <body>
@@ -72,6 +73,40 @@ TEMPLATE = """
 # --- HELPERS -----------
 # ========================
 
+def fetch_iframe_title(iframe_url: str, base_url: str = "") -> str:
+    """
+    Fetch the content of an iframe URL and extract the first title tag (h2-h6).
+    Returns the raw text content of the title, or empty string if not found or error.
+    """
+    try:
+        # Handle relative URLs
+        if base_url and not urlparse(iframe_url).netloc:
+            iframe_url = urljoin(base_url, iframe_url)
+        
+        # Normalize URL
+        normalized = normalize_url(iframe_url)
+        if not normalized:
+            return ""
+        
+        headers = {"User-Agent": "HTML-Scraper/1.0"}
+        resp = requests.get(normalized, headers=headers, timeout=10)
+        resp.raise_for_status()
+        
+        soup = BeautifulSoup(resp.text, "html.parser")
+        
+        # Look for first title tag (h2-h6)
+        title_tags = ["h2", "h3", "h4", "h5", "h6"]
+        for tag_name in title_tags:
+            title_element = soup.find(tag_name)
+            if title_element:
+                # Extract raw text, stripping all HTML tags
+                return title_element.get_text(strip=True)
+        
+        return ""
+    except Exception:
+        # If any error occurs, return empty string
+        return ""
+
 def normalize_url(u: str) -> str:
     u = u.strip()
     if not u:
@@ -99,13 +134,13 @@ def _find_script_after(tag: Tag, boundary: Tag):
                 return None
     return None
 
-def _process_allowed_element(el: Tag):
+def _process_allowed_element(el: Tag, base_url: str = ""):
     """
     Given an allowed block Tag el, find any iframe+script pairs inside it,
     extract them, and split el's HTML into a sequence of parts:
      - content segments (strings) and
-     - iframe blocks (strings)
-    Returns list of parts in order. iframe-block parts are exact HTML strings containing the iframe+script.
+     - iframe blocks (strings with title prefixes)
+    Returns list of parts in order. iframe-block parts are strings containing title + iframe+script HTML.
     """
     # Collect pairs in document order
     pairs = []
@@ -122,12 +157,25 @@ def _process_allowed_element(el: Tag):
     token_map = {}
     html_str = str(el)
     for idx, (iframe, script) in enumerate(pairs):
+        # Extract iframe src and fetch title
+        iframe_src = iframe.get('src', '')
+        title = ""
+        if iframe_src:
+            title = fetch_iframe_title(iframe_src, base_url)
+        
         pair_html = str(iframe) + str(script)
+        
+        # Add title prefix if found
+        if title:
+            prefixed_html = f"<h3>{title}</h3>\n{pair_html}"
+        else:
+            prefixed_html = pair_html
+        
         token = f"@@IFRAME_SEQ_{idx}@@"
         # Replace only the first occurrence of this exact sequence
         html_str, n = re.subn(re.escape(pair_html), token, html_str, count=1, flags=re.DOTALL)
         if n == 1:
-            token_map[token] = pair_html
+            token_map[token] = prefixed_html
         else:
             # fallback: if exact concatenation didn't match (rare), try replacing iframe alone then script alone
             # replace iframe first
@@ -140,7 +188,7 @@ def _process_allowed_element(el: Tag):
                 # join tokens so splitting keeps them together
                 combined_token = f"@@IFRAME_SEQ_{idx}@@"
                 html_str = html_str.replace(iframe_token + ".*?" + script_token, combined_token)  # not ideal, but fallback
-                token_map[combined_token] = str(iframe) + str(script)
+                token_map[combined_token] = prefixed_html
             else:
                 # give up for this pair (leave as-is)
                 pass
@@ -164,7 +212,7 @@ def _process_allowed_element(el: Tag):
                 result.append(part)
     return result
 
-def extract_blocks_recursive(element: Tag):
+def extract_blocks_recursive(element: Tag, base_url: str = ""):
     """
     Traverse element recursively and collect blocks.
     Allowed elements produce content parts (which may be split by iframe/script).
@@ -182,7 +230,7 @@ def extract_blocks_recursive(element: Tag):
 
         # If this is an allowed block, process it (do NOT descend further for this el)
         if el.name in ALLOWED_TAGS:
-            parts = _process_allowed_element(el)
+            parts = _process_allowed_element(el, base_url)
             for part in parts:
                 # part is either a content HTML (string) or an iframe+script HTML (string containing '<iframe' and '<script')
                 if "<iframe" in part and "<script" in part:
@@ -243,7 +291,7 @@ def index():
                 if not content:
                     error = f"Could not find {BASE_SELECTOR} in the page."
                 else:
-                    extracted_blocks = extract_blocks_recursive(content)
+                    extracted_blocks = extract_blocks_recursive(content, normalized)
 
                     # compute summary
                     for block_html in extracted_blocks:
