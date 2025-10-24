@@ -1,0 +1,3 @@
+# Leave content inside the `venv` folder out of the project.
+venv
+venv/*
