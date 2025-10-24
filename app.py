@@ -12,6 +12,7 @@ app = Flask(__name__)
 # ========================
 
 BASE_SELECTOR = ".ResponsivePage-content, .BlogPost"
+DEFAULT_SELECTOR = BASE_SELECTOR  # Keep original as default
 ALLOWED_TAGS = {"p", "blockquote", "ul", "ol", "li", "h2", "h3", "h4", "h5", "h6"}
 # We look for iframe followed (in document order) by a script within the same allowed element.
 SPECIAL_SEQUENCE = ("iframe", "script")
@@ -28,7 +29,9 @@ TEMPLATE = """
   <title>HTML Scraper</title>
   <style>
     body { font-family: system-ui, -apple-system, "Segoe UI", Roboto; padding: 20px; max-width: 1000px; margin:auto;}
-    form { margin-bottom: 1rem; display:flex; gap:8px; align-items:center; }
+    form { margin-bottom: 1rem; }
+    .form-row { display:flex; gap:8px; align-items:center; margin-bottom: 8px; }
+    .form-row label { min-width: 80px; font-size: 0.9rem; color: #656d76; }
     input[type="text"] { flex:1; padding:8px; font-size:1rem; }
     button { padding:8px 12px; font-size:1rem; }
     pre { background:#f6f8fa; border:1px solid #e1e4e8; padding:12px; overflow:auto; white-space:pre-wrap; position: relative; }
@@ -64,8 +67,18 @@ TEMPLATE = """
 <body>
   <h1>HTML Scraper</h1>
   <form method="post" action="{{ url_for('index') }}">
-    <input id="url" name="url" type="text" placeholder="https://example.com" value="{{ url_value|default('') }}" required />
-    <button type="submit">Fetch</button>
+    <div class="form-row">
+      <label for="url">URL:</label>
+      <input id="url" name="url" type="text" placeholder="https://example.com" value="{{ url_value|default('') }}" required />
+    </div>
+    <div class="form-row">
+      <label for="selector">Selector:</label>
+      <input id="selector" name="selector" type="text" placeholder="CSS selector" value="{{ selector_value|default('') }}" />
+    </div>
+    <div class="form-row">
+      <label></label>
+      <button type="submit">Fetch</button>
+    </div>
   </form>
 
   {% if error %}
@@ -422,12 +435,19 @@ def index():
     error = None
     html_source = None
     url_value = ""
+    selector_value = DEFAULT_SELECTOR
     displayed_url = ""
     extracted_blocks = []
     summary = {"content_blocks": 0, "iframe_blocks": 0}
 
     if request.method == "POST":
         url_value = request.form.get("url", "")
+        selector_value = request.form.get("selector", DEFAULT_SELECTOR).strip()
+        
+        # Use default selector if user left it empty
+        if not selector_value:
+            selector_value = DEFAULT_SELECTOR
+            
         normalized = normalize_url(url_value)
         if not normalized:
             error = "The URL looks invalid. Include hostname and scheme."
@@ -441,9 +461,9 @@ def index():
                 url_value = normalized
 
                 soup = BeautifulSoup(html_source, "html.parser")
-                content = soup.select_one(BASE_SELECTOR)
+                content = soup.select_one(selector_value)
                 if not content:
-                    error = f"Could not find {BASE_SELECTOR} in the page."
+                    error = f"Could not find '{selector_value}' in the page."
                 else:
                     extracted_blocks = extract_blocks_recursive(content, normalized)
 
@@ -479,6 +499,7 @@ def index():
         error=error,
         html_source=html_source,
         url_value=url_value,
+        selector_value=selector_value,
         displayed_url=displayed_url,
         extracted_blocks=extracted_blocks,
         summary=summary
