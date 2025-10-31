@@ -13,7 +13,9 @@ app = Flask(__name__)
 
 BASE_SELECTOR = ".ResponsivePage-content, .BlogPost"
 DEFAULT_SELECTOR = BASE_SELECTOR  # Keep original as default
-ALLOWED_TAGS = {"p", "blockquote", "ul", "ol", "li", "h2", "h3", "h4", "h5", "h6"}
+ALLOWED_TAGS = {"p", "blockquote", "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6"}
+# Tags to search for titles in iframe destinations (in priority order)
+IFRAME_TITLE_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6"]
 # We look for iframe followed (in document order) by a script within the same allowed element.
 SPECIAL_SEQUENCE = ("iframe", "script")
 
@@ -175,7 +177,8 @@ TEMPLATE = """
 
 def fetch_iframe_title(iframe_url: str, base_url: str = "") -> str:
     """
-    Fetch the content of an iframe URL and extract the first title tag (h2-h6).
+    Fetch the content of an iframe URL and extract the first title tag.
+    Uses IFRAME_TITLE_TAGS configuration for which tags to search.
     Returns the raw text content of the title, or empty string if not found or error.
     """
     try:
@@ -194,9 +197,8 @@ def fetch_iframe_title(iframe_url: str, base_url: str = "") -> str:
         
         soup = BeautifulSoup(resp.text, "html.parser")
         
-        # Look for first title tag (h2-h6)
-        title_tags = ["h2", "h3", "h4", "h5", "h6"]
-        for tag_name in title_tags:
+        # Look for first title tag using configured tags (in priority order)
+        for tag_name in IFRAME_TITLE_TAGS:
             title_element = soup.find(tag_name)
             if title_element:
                 # Extract raw text, stripping all HTML tags
